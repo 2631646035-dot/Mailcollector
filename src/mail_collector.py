@@ -340,6 +340,8 @@ class SmallActionButton(QPushButton):
 
 
 class SegmentedControl(QWidget):
+    value_changed = Signal(str)
+
     def __init__(self, items, default_value=None, parent=None):
         super().__init__(parent)
 
@@ -382,6 +384,7 @@ class SegmentedControl(QWidget):
             self.group.addButton(btn)
             layout.addWidget(btn)
             self.buttons.append(btn)
+            btn.clicked.connect(lambda checked, v=value: self.value_changed.emit(v))
 
             if default_value is not None and value == default_value:
                 btn.setChecked(True)
@@ -399,6 +402,7 @@ class SegmentedControl(QWidget):
         for btn in self.buttons:
             if btn.property("value") == value:
                 btn.setChecked(True)
+                return
                 return
 
 
@@ -1691,7 +1695,9 @@ class CreateTaskPage(QWidget):
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
         title_box.addWidget(TitleLabel("邮件收集助手"))
-        title_box.addWidget(SubtitleLabel("从 Outlook 自动收集邮件、附件和压缩包"))
+        subtitle = SubtitleLabel("从 Outlook 自动收集邮件、附件和压缩包")
+        subtitle.setObjectName("subtitle")
+        title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
 
