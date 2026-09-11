@@ -785,9 +785,9 @@ class OutlookWorker(QThread):
                                         with zipfile.ZipFile(save_path, "r") as zf:
                                             zf.extractall(unzip_dir)
                                     elif file_ext == ".rar":
-                                        self._extract_rar(save_path, unzip_dir)
+                                        OutlookWorker._extract_rar(save_path, unzip_dir)
                                     elif file_ext == ".7z":
-                                        self._extract_7z(save_path, unzip_dir)
+                                        OutlookWorker._extract_7z(save_path, unzip_dir)
 
                                     self.progress.emit(f"  📂 已解压到: {os.path.basename(unzip_dir)}")
 
@@ -945,7 +945,8 @@ class OutlookWorker(QThread):
     def _sanitize_filename(self, s):
         return re.sub(r'[\\/*?:"<>|]', "_", s)[:100]
 
-    def _extract_rar(self, rar_path, out_dir):
+    @staticmethod
+    def _extract_rar(rar_path, out_dir):
         import subprocess
 
         unrar_paths = [
@@ -960,7 +961,8 @@ class OutlookWorker(QThread):
 
         raise RuntimeError("未找到 WinRAR/UnRAR，请安装 WinRAR 或使用 .zip 格式")
 
-    def _extract_7z(self, sz_path, out_dir):
+    @staticmethod
+    def _extract_7z(sz_path, out_dir):
         import subprocess
 
         sz_paths = [
@@ -974,6 +976,242 @@ class OutlookWorker(QThread):
                 return
 
         raise RuntimeError("未找到 7-Zip，请安装 7-Zip 或使用 .zip 格式")
+
+
+# ─── IMAP Worker ───
+
+class IMAPWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, conditions, output_dir, action, imap_config):
+        super().__init__()
+        self.conditions = conditions
+        self.output_dir = output_dir
+        self.action = action
+        self.imap_config = imap_config
+
+    def run(self):
+        import imaplib
+        import email
+        from email.header import decode_header
+
+        try:
+            self.progress.emit("🔍 正在连接 IMAP 服务器...")
+
+            server = self.imap_config["server"]
+            port = self.imap_config["port"]
+            account = self.imap_config["account"]
+            password = self.imap_config["password"]
+
+            conn = imaplib.IMAP4_SSL(server, port)
+            conn.login(account, password)
+            conn.select("INBOX")
+
+            self.progress.emit("🔍 正在搜索邮件...")
+            self.progress.emit(f"[条件] {self.conditions}")
+
+            _, data = conn.search(None, "ALL")
+            mail_ids = data[0].split()
+            total = len(mail_ids)
+
+            self.progress.emit(f"📬 扫描邮件: {total} 封")
+
+            matched = 0
+            saved = 0
+            errors = []
+            all_mails = []
+
+            for i, mid in enumerate(mail_ids):
+                try:
+                    _, msg_data = conn.fetch(mid, "(RFC822)")
+                    raw_email = msg_data[0][1]
+                    msg = email.message_from_bytes(raw_email)
+                except:
+                    continue
+
+                subject = self._decode_header(msg.get("Subject", ""))
+                sender = msg.get("From", "")
+                date_str = msg.get("Date", "")
+                body = self._get_body(msg)
+
+                has_att = False
+                for part in msg.walk():
+                    if part.get_content_disposition() == "attachment":
+                        has_att = True
+                        break
+
+                received = None
+                if date_str:
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        received = parsedate_to_datetime(date_str)
+                        if received.tzinfo is None:
+                            received = received.replace(tzinfo=timezone.utc)
+                    except:
+                        pass
+
+                ok, reason = self._match_imap(subject, body, sender, received, has_att)
+
+                all_mails.append({
+                    "subject": subject[:80],
+                    "sender": sender,
+                    "date": str(received)[:19] if received else "",
+                    "matched": ok,
+                    "reason": reason
+                })
+
+                if not ok:
+                    if len(all_mails) <= 30 and not ok:
+                        self.progress.emit(f"✗ #{len(all_mails)} {reason}: {subject[:50]}")
+                    continue
+
+                matched += 1
+                self.progress.emit(f"✅ 匹配: {subject[:50]}")
+
+                if self.action in ("attachment", "both"):
+                    exts = self.conditions.get("attachment_exts", [])
+                    auto_unzip = self.conditions.get("auto_unzip", True)
+                    ZIP_EXTS = {'.zip', '.rar', '.7z'}
+
+                    for part in msg.walk():
+                        if part.get_content_disposition() != "attachment":
+                            continue
+
+                        fname = part.get_filename()
+                        if not fname:
+                            continue
+                        fname = self._decode_header(fname)
+
+                        _, file_ext = os.path.splitext(fname.lower())
+                        if exts and file_ext not in [e.lower() for e in exts]:
+                            continue
+
+                        save_path = os.path.join(self.output_dir, fname)
+                        base, e = os.path.splitext(fname)
+                        c = 1
+                        while os.path.exists(save_path):
+                            save_path = os.path.join(self.output_dir, f"{base}_{c}{e}")
+                            c += 1
+
+                        try:
+                            with open(save_path, "wb") as f:
+                                f.write(part.get_payload(decode=True))
+                            saved += 1
+                            self.progress.emit(f"  📎 保存: {os.path.basename(save_path)}")
+
+                            if auto_unzip and file_ext in ZIP_EXTS:
+                                try:
+                                    unzip_dir = os.path.join(self.output_dir, base)
+                                    os.makedirs(unzip_dir, exist_ok=True)
+                                    if file_ext == '.zip':
+                                        with zipfile.ZipFile(save_path, 'r') as zf:
+                                            zf.extractall(unzip_dir)
+                                    elif file_ext == '.rar':
+                                        OutlookWorker._extract_rar(None, save_path, unzip_dir)
+                                    elif file_ext == '.7z':
+                                        OutlookWorker._extract_7z(None, save_path, unzip_dir)
+                                    self.progress.emit(f"  📂 已解压到: {os.path.basename(unzip_dir)}")
+                                except Exception as ze:
+                                    self.progress.emit(f"  ⚠ 解压失败: {ze}")
+                        except Exception as ex:
+                            errors.append(f"{fname}: {ex}")
+
+            fail_reasons = {}
+            for m in all_mails:
+                if not m["matched"]:
+                    r = m["reason"]
+                    fail_reasons[r] = fail_reasons.get(r, 0) + 1
+
+            result = {
+                "scanned": total,
+                "matched": matched,
+                "saved": saved,
+                "errors": errors,
+                "output": self.output_dir,
+                "conditions": self.conditions,
+                "all_mails": all_mails,
+                "fail_reasons": fail_reasons
+            }
+
+            conn.close()
+            conn.logout()
+            self.finished.emit(result)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _decode_header(self, h):
+        from email.header import decode_header
+        try:
+            parts = decode_header(h)
+            result = []
+            for part, charset in parts:
+                if isinstance(part, bytes):
+                    result.append(part.decode(charset or "utf-8", errors="replace"))
+                else:
+                    result.append(str(part))
+            return "".join(result)
+        except:
+            return str(h)
+
+    def _get_body(self, msg):
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    try:
+                        charset = part.get_content_charset() or "utf-8"
+                        body += part.get_payload(decode=True).decode(charset, errors="replace")
+                    except:
+                        pass
+        else:
+            try:
+                charset = msg.get_content_charset() or "utf-8"
+                body = msg.get_payload(decode=True).decode(charset, errors="replace")
+            except:
+                body = str(msg.get_payload())
+        return body
+
+    def _match_imap(self, subject, body, sender, received, has_att):
+        c = self.conditions
+
+        if c.get("date_from") and received:
+            if received < c["date_from"]:
+                return (False, "date_before_range")
+        if c.get("date_to") and received:
+            if received > c["date_to"]:
+                return (False, "date_after_range")
+
+        title_text = c.get("title_text", "").strip()
+        if title_text:
+            if c.get("title_mode") == "startswith":
+                if not subject.lower().startswith(title_text.lower()):
+                    return (False, "title_startswith")
+            else:
+                if title_text.lower() not in subject.lower():
+                    return (False, "title_contains")
+
+        body_text = c.get("body_text", "").strip()
+        if body_text:
+            keywords = [k.strip() for k in body_text.split(",") if k.strip()]
+            if c.get("body_mode") == "any":
+                if not any(k.lower() in body.lower() for k in keywords):
+                    return (False, "body_keyword")
+            else:
+                if not all(k.lower() in body.lower() for k in keywords):
+                    return (False, "body_keyword")
+
+        sender_text = c.get("sender_text", "").strip()
+        if sender_text:
+            if sender_text.lower() not in sender.lower():
+                return (False, "sender")
+
+        if c.get("has_attachments") and not has_att:
+            return (False, "no_attachments")
+
+        return (True, "")
 
 
 # ─── 方案管理 ───
@@ -1459,6 +1697,73 @@ class CreateTaskPage(QWidget):
 
         layout.addLayout(header)
 
+        # 邮箱类型选择
+        source_card = Card()
+        scl = QVBoxLayout(source_card)
+        scl.setContentsMargins(24, 16, 24, 16)
+        scl.setSpacing(10)
+        scl.addWidget(FieldLabel("邮箱来源"))
+        source_row = QHBoxLayout()
+        source_row.setSpacing(12)
+        self.mail_source = SegmentedControl([
+            ("outlook", "Outlook 客户端"),
+            ("imap", "IMAP 邮箱"),
+        ], default_value="outlook")
+        self.mail_source.value_changed.connect(self._on_source_changed)
+        source_row.addWidget(self.mail_source)
+        source_row.addStretch()
+        scl.addLayout(source_row)
+
+        # IMAP 配置面板（默认隐藏）
+        self.imap_panel = QWidget()
+        self.imap_panel.setVisible(False)
+        imap_layout = QVBoxLayout(self.imap_panel)
+        imap_layout.setContentsMargins(0, 6, 0, 0)
+        imap_layout.setSpacing(8)
+
+        imap_row1 = QHBoxLayout()
+        imap_row1.setSpacing(10)
+        imap_left = QVBoxLayout()
+        imap_left.setSpacing(4)
+        imap_left.addWidget(FieldLabel("IMAP 服务器"))
+        self.imap_server = QLineEdit()
+        self.imap_server.setPlaceholderText("例如: imap.gmail.com")
+        imap_left.addWidget(self.imap_server)
+        imap_row1.addLayout(imap_left)
+        imap_right = QVBoxLayout()
+        imap_right.setSpacing(4)
+        imap_right.addWidget(FieldLabel("端口"))
+        self.imap_port = QLineEdit()
+        self.imap_port.setPlaceholderText("993")
+        self.imap_port.setText("993")
+        self.imap_port.setFixedWidth(100)
+        imap_right.addWidget(self.imap_port)
+        imap_row1.addLayout(imap_right)
+        imap_layout.addLayout(imap_row1)
+
+        imap_row2 = QHBoxLayout()
+        imap_row2.setSpacing(10)
+        imap_acc = QVBoxLayout()
+        imap_acc.setSpacing(4)
+        imap_acc.addWidget(FieldLabel("邮箱账号"))
+        self.imap_account = QLineEdit()
+        self.imap_account.setPlaceholderText("your@email.com")
+        imap_acc.addWidget(self.imap_account)
+        imap_row2.addLayout(imap_acc)
+        imap_pwd = QVBoxLayout()
+        imap_pwd.setSpacing(4)
+        imap_pwd.addWidget(FieldLabel("密码/授权码"))
+        self.imap_password = QLineEdit()
+        self.imap_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.imap_password.setPlaceholderText("请输入密码或应用授权码")
+        imap_pwd.addWidget(self.imap_password)
+        imap_row2.addLayout(imap_pwd)
+        imap_layout.addLayout(imap_row2)
+
+        scl.addWidget(self.imap_panel)
+
+        layout.addWidget(source_card)
+
         steps = QHBoxLayout()
         steps.setSpacing(8)
         steps.addWidget(StepBadge("1 选邮件", C_PRIMARY))
@@ -1795,6 +2100,24 @@ class CreateTaskPage(QWidget):
             return "email"
         return "both"
 
+    def _on_source_changed(self, value):
+        self.imap_panel.setVisible(value == "imap")
+        subtitle = self.findChild(QLabel, "subtitle")
+        if value == "outlook":
+            self.findChild(QLabel, "subtitle").setText("从 Outlook 自动收集邮件、附件和压缩包")
+        else:
+            self.findChild(QLabel, "subtitle").setText("从 IMAP 邮箱自动收集邮件、附件和压缩包")
+
+    def _get_imap_config(self):
+        if self.mail_source.value() != "imap":
+            return None
+        return {
+            "server": self.imap_server.text().strip(),
+            "port": int(self.imap_port.text().strip() or "993"),
+            "account": self.imap_account.text().strip(),
+            "password": self.imap_password.text(),
+        }
+
     def _run(self):
         output = self.output_dir_edit.text().strip()
 
@@ -1811,11 +2134,14 @@ class CreateTaskPage(QWidget):
 
         conditions = refresh_dynamic_dates(self._get_conditions())
 
-        self.worker = OutlookWorker(
-            conditions,
-            output,
-            self._get_action()
-        )
+        if self.mail_source.value() == "imap":
+            imap_config = self._get_imap_config()
+            if not imap_config or not imap_config["server"] or not imap_config["account"]:
+                QMessageBox.warning(self, "提示", "请填写完整的 IMAP 配置")
+                return
+            self.worker = IMAPWorker(conditions, output, self._get_action(), imap_config)
+        else:
+            self.worker = OutlookWorker(conditions, output, self._get_action())
 
         self.worker.progress.connect(self._on_progress)
         self.worker.finished.connect(self._on_finished)
@@ -1921,6 +2247,8 @@ class CreateTaskPage(QWidget):
             "conditions": self._get_conditions(),
             "action": self._get_action(),
             "output_dir": self.output_dir_edit.text(),
+            "mail_source": self.mail_source.value(),
+            "imap_config": self._get_imap_config() if self.mail_source.value() == "imap" else None,
             "created": old_created if mode == "overwrite" and self.editing_plan_id else datetime.now().strftime("%Y-%m-%d %H:%M"),
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "schedule": old_schedule if mode == "overwrite" and self.editing_plan_id else {
@@ -2002,6 +2330,17 @@ class CreateTaskPage(QWidget):
             self.action_email.setChecked(True)
         else:
             self.action_both.setChecked(True)
+
+        # 还原邮箱来源和IMAP配置
+        source = plan.get("mail_source", "outlook")
+        self.mail_source.set_value(source)
+        self.imap_panel.setVisible(source == "imap")
+        if source == "imap":
+            imap_cfg = plan.get("imap_config") or {}
+            self.imap_server.setText(imap_cfg.get("server", ""))
+            self.imap_port.setText(str(imap_cfg.get("port", "993")))
+            self.imap_account.setText(imap_cfg.get("account", ""))
+            self.imap_password.clear()
 
     def clear_editing_plan(self):
         self.editing_plan_id = None
@@ -2488,7 +2827,16 @@ class MainWindow(QMainWindow):
             conditions["_dedupe"] = True
             conditions["_dedupe_root"] = output
 
-            worker = OutlookWorker(conditions, output, action)
+            source = fresh_plan.get("mail_source", "outlook")
+            if source == "imap":
+                imap_config = fresh_plan.get("imap_config")
+                if imap_config:
+                    worker = IMAPWorker(conditions, output, action, imap_config)
+                else:
+                    self.create_page.progress.emit("⚠ IMAP方案缺少配置，跳过")
+                    return
+            else:
+                worker = OutlookWorker(conditions, output, action)
             self.scheduled_workers.append(worker)
 
             worker.finished.connect(
